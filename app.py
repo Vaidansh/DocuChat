@@ -6,7 +6,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
-import os
 import time
 
 # Load environment variables
@@ -34,45 +33,43 @@ def get_text_chunks(text):
     chunks = text_splitter.split_text(text)
     return chunks
 
-def get_vector_store(text_chunks):
-    """Generate embeddings and save to a local FAISS index with rate limit handling."""
+def build_vector_store_in_memory(text_chunks):
+    """Generate embeddings and save to st.session_state to avoid multi-user data leakage."""
     embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2")
     
-    vector_store = None
-    batch_size = 5  # Process 5 chunks at a time
+    batch_size = 5  # Process 5 chunks at a time to handle rate limits
     
-    # Progress bar for the UI
-    progress_text = "Embedding chunks... Please wait to avoid rate limits."
+    progress_text = "Embedding chunks safely into your session memory..."
     my_bar = st.progress(0, text=progress_text)
     total_batches = (len(text_chunks) + batch_size - 1) // batch_size
+
+    # Reset or initialize the session-specific vector store
+    st.session_state.vector_store = None
 
     for i in range(0, len(text_chunks), batch_size):
         batch = text_chunks[i:i + batch_size]
         
-        if vector_store is None:
-            vector_store = FAISS.from_texts(batch, embedding=embeddings)
+        if st.session_state.vector_store is None:
+            st.session_state.vector_store = FAISS.from_texts(batch, embedding=embeddings)
         else:
-            vector_store.add_texts(batch)
+            st.session_state.vector_store.add_texts(batch)
             
-        # Update progress bar
         current_batch = (i // batch_size) + 1
         my_bar.progress(current_batch / total_batches, text=progress_text)
         
-        # Sleep for 10 seconds between batches to let the API rate limits reset
+        # Sleep to let the free-tier API rate limits reset
         if current_batch < total_batches:
             time.sleep(10) 
             
-    vector_store.save_local("faiss_index")
-    my_bar.empty() # Clear the progress bar when done
+    my_bar.empty()
 
 def get_conversational_chain():
-    """Set up the LLM chain with a strict prompt template."""
+    """Set up the LLM chain with a flexible prompt template."""
     prompt_template = """
     You are a highly intelligent and helpful assistant. 
     First, look at the provided Context to see if it helps answer the user's Question. 
     If the Context contains relevant information, use it to build your answer.
     If the Context does NOT contain the answer, do not apologize or say it is unavailable. Instead, answer the question using your own general knowledge to the best of your ability.
-    (Optional: You can subtly mention if you had to rely on general knowledge instead of the document, but always provide a helpful answer).
 
     Context:
     {context}
@@ -90,29 +87,24 @@ def get_conversational_chain():
     return chain
 
 def handle_user_question(user_question):
-    """Embed question, search FAISS, and generate an answer with error handling."""
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2")
-    
-    # Load the local FAISS index
-    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    
+    """Search the session-isolated FAISS instance and generate an answer."""
     try:
-        # Similarity search for top 4 documents
-        docs = new_db.similarity_search(user_question, k=4)
+        # Pull the vector store directly from the current user's session state
+        vector_store = st.session_state.vector_store
         
-        # Join chunk text as context
+        # Similarity search for top 4 documents
+        docs = vector_store.similarity_search(user_question, k=4)
         context = "\n\n".join([doc.page_content for doc in docs])
         
         # Generate answer
         chain = get_conversational_chain()
         response = chain.invoke({"context": context, "question": user_question})
-        
         return response
         
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-            return "⏳ **Rate Limit Hit:** Google's free API is cooling down after processing your documents. Please wait about 60 seconds and ask your question again!"
+            return "⏳ **Rate Limit Hit:** Google's free API is cooling down. Please wait about 60 seconds and ask your question again!"
         else:
             return f"⚠️ **An unexpected error occurred:** {error_msg}"
 
@@ -122,6 +114,10 @@ def main():
     # Initialize chat history in session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+        
+    # Initialize the vector store key in session state if not present
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = None
 
     # Display chat messages from history on app rerun
     for message in st.session_state.messages:
@@ -141,29 +137,27 @@ def main():
                 st.warning("Please upload at least one PDF.")
             else:
                 with st.spinner("Processing..."):
-                    # 1. Extract text
                     raw_text = get_pdf_text(pdf_docs)
-                    # 2. Split text
                     text_chunks = get_text_chunks(raw_text)
-                    # 3. Create Vector Store
-                    get_vector_store(text_chunks)
-                    st.success("Processing Complete! FAISS index saved.")
+                    
+                    # Build and store directly in the user's isolated session state
+                    build_vector_store_in_memory(text_chunks)
+                    st.success("Processing Complete! Your session index is ready.")
 
     # Accept user input via chat interface
     if prompt := st.chat_input("Ask a question about your documents..."):
-        # Guard: Check if FAISS index exists before answering
-        if not os.path.exists("faiss_index"):
+        # Guard: Check session state instead of the local disk directory
+        if st.session_state.vector_store is None:
             st.warning("Please upload and process a PDF from the sidebar first.")
             return
 
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Display user message in chat message container
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Display assistant response in chat message container
+        # Display assistant response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 response = handle_user_question(prompt)
